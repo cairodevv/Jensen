@@ -199,7 +199,7 @@ int main() {
         fs::create_directory("data");
 
         std::string datasetFile = "data/rust_detection_dataset.json";
-        std::string datasetURL = "https://raw.githubusercontent.com/cairodevv/Jensen/refs/heads/main/build/rust_detection_dataset.json";
+        std::string datasetURL = "https://raw.githubusercontent.com/cairodevv/Jensen/refs/heads/main/datasets/rust_detection_dataset.json";
         std::string weightsFile = "data/weights.json";
 
         if (!fs::exists(datasetFile)) {
