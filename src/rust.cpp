@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <random>
 #include <filesystem>
+#include <curl/curl.h>
 
 #include "json.hpp"
 
@@ -29,14 +30,41 @@ std::map<char,int> charClassification = {
     {']',89},{'^',90},{'_',91},{'`',92},{'{',93},{'|',94},{'}',95},{'~',96}
 };
 
-const int CHAR_COUNT = 97; // total number of characters
-const int MAX_INPUT = 20;  // max length of input
+const int CHAR_COUNT = 97;
+const int MAX_INPUT_LEN = 20;
 
 // ------------------ Dataset Struct ------------------
 struct DatasetExtract {
     std::vector<int> input;
     float label;
 };
+
+// ------------------ Curl download ------------------
+size_t curlWrite(void* ptr, size_t size, size_t nmemb, std::string* data) {
+    data->append((char*)ptr, size * nmemb);
+    return size * nmemb;
+}
+
+void downloadDataset(const std::string& url, const std::string& outFile) {
+    CURL* curl = curl_easy_init();
+    if (!curl) throw std::runtime_error("Failed to init CURL");
+
+    std::string buffer;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWrite);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        curl_easy_cleanup(curl);
+        throw std::runtime_error("CURL download failed: " + std::string(curl_easy_strerror(res)));
+    }
+    curl_easy_cleanup(curl);
+
+    std::ofstream f(outFile);
+    f << buffer;
+}
 
 // ------------------ Load Dataset ------------------
 std::vector<DatasetExtract> loadDataset(const std::string& filename) {
@@ -61,26 +89,24 @@ std::vector<DatasetExtract> loadDataset(const std::string& filename) {
 
 // ------------------ One-hot encode ------------------
 std::vector<float> oneHotEncode(const std::vector<int>& input) {
-    std::vector<float> encoded(MAX_INPUT * CHAR_COUNT, 0.0f);
-    for (int i = 0; i < MAX_INPUT && i < input.size(); ++i) {
+    std::vector<float> encoded(MAX_INPUT_LEN * CHAR_COUNT, 0.0f);
+    for (int i = 0; i < MAX_INPUT_LEN && i < input.size(); ++i) {
         int idx = input[i];
         if (idx >= 0 && idx < CHAR_COUNT) encoded[i * CHAR_COUNT + idx] = 1.0f;
     }
     return encoded;
 }
 
-// ------------------ Activation functions ------------------
+// ------------------ Activation ------------------
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
-float dsigmoid(float y) { return y * (1.0f - y); } // derivative assuming input y=sigmoid(x)
+float dsigmoid(float y) { return y * (1.0f - y); }
 
-// ------------------ Neural network ------------------
+// ------------------ NeuralNet ------------------
 struct NeuralNet {
     int inputSize;
     int hiddenSize;
     float learningRate;
-    std::vector<float> W1; // input -> hidden
-    std::vector<float> b1;
-    std::vector<float> W2; // hidden -> output
+    std::vector<float> W1, b1, W2;
     float b2;
 
     NeuralNet(int inSize, int hidSize, float lr)
@@ -98,13 +124,11 @@ struct NeuralNet {
         for (auto &w : W2) w = dist(gen);
     }
 
-    // Forward pass
     float forward(const std::vector<float>& x, std::vector<float>& hiddenOut) const {
         hiddenOut.resize(hiddenSize);
         for (int j = 0; j < hiddenSize; ++j) {
             float sum = b1[j];
-            for (int i = 0; i < inputSize; ++i)
-                sum += x[i] * W1[i*hiddenSize + j];
+            for (int i = 0; i < inputSize; ++i) sum += x[i] * W1[i*hiddenSize + j];
             hiddenOut[j] = sigmoid(sum);
         }
         float z = b2;
@@ -112,14 +136,11 @@ struct NeuralNet {
         return sigmoid(z);
     }
 
-    // Training
     void train(const std::vector<DatasetExtract>& dataset, int epochs) {
         for (int epoch = 0; epoch < epochs; ++epoch) {
             float epochLoss = 0.0f;
-
             std::vector<DatasetExtract> data = dataset;
-            std::random_device rd;
-            std::mt19937 g(rd());
+            std::mt19937 g(std::random_device{}());
             std::shuffle(data.begin(), data.end(), g);
 
             for (auto &ex : data) {
@@ -147,7 +168,6 @@ struct NeuralNet {
         }
     }
 
-    // Prediction
     int predict(const std::vector<int>& input) const {
         auto x = oneHotEncode(input);
         std::vector<float> hidden;
@@ -156,23 +176,16 @@ struct NeuralNet {
         return (prob >= 0.5f) ? 1 : 0;
     }
 
-    // Save weights
     void save(const std::string& filename) const {
         json j;
-        j["W1"] = W1;
-        j["b1"] = b1;
-        j["W2"] = W2;
-        j["b2"] = b2;
-        std::ofstream f(filename);
-        f << j.dump(4);
+        j["W1"] = W1; j["b1"] = b1; j["W2"] = W2; j["b2"] = b2;
+        std::ofstream f(filename); f << j.dump(4);
     }
 
-    // Load weights
     void load(const std::string& filename) {
         std::ifstream f(filename);
         if (!f.is_open()) throw std::runtime_error("Cannot open weights file: " + filename);
-        json j;
-        f >> j;
+        json j; f >> j;
         W1 = j["W1"].get<std::vector<float>>();
         b1 = j["b1"].get<std::vector<float>>();
         W2 = j["W2"].get<std::vector<float>>();
@@ -183,13 +196,21 @@ struct NeuralNet {
 // ------------------ Main ------------------
 int main() {
     try {
-        auto dataset = loadDataset("rust_detection_dataset.json");
-        if (dataset.empty()) { std::cerr << "Dataset empty!\n"; return 1; }
-
         fs::create_directory("data");
+
+        std::string datasetFile = "data/rust_detection_dataset.json";
+        std::string datasetURL = "https://raw.githubusercontent.com/cairodevv/Jensen/refs/heads/main/build/rust_detection_dataset.json";
         std::string weightsFile = "data/weights.json";
 
-        int inputSize = MAX_INPUT * CHAR_COUNT;
+        if (!fs::exists(datasetFile)) {
+            std::cout << "Downloading dataset...\n";
+            downloadDataset(datasetURL, datasetFile);
+        }
+
+        auto dataset = loadDataset(datasetFile);
+        if (dataset.empty()) { std::cerr << "Dataset empty!\n"; return 1; }
+
+        int inputSize = MAX_INPUT_LEN * CHAR_COUNT;
         int hiddenSize = 64;
         float learningRate = 0.01f;
 
@@ -205,13 +226,12 @@ int main() {
             nn.save(weightsFile);
         }
 
-        // User input
         std::string input;
         std::cout << "Enter text to classify: ";
         std::getline(std::cin, input);
 
-        std::vector<int> userInput(MAX_INPUT, 62);
-        for (int i = 0; i < MAX_INPUT && i < input.size(); ++i) {
+        std::vector<int> userInput(MAX_INPUT_LEN, 62);
+        for (int i = 0; i < MAX_INPUT_LEN && i < input.size(); ++i) {
             auto it = charClassification.find(input[i]);
             userInput[i] = (it != charClassification.end()) ? it->second : 62;
         }
